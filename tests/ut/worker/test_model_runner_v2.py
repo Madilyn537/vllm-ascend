@@ -5,9 +5,12 @@ import numpy as np
 import pytest
 import torch
 from vllm.config import CUDAGraphMode
-from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+from vllm.v1.worker.gpu.model_runner import BatchReqState, GPUModelRunner
 
+from vllm_ascend.worker.v2 import model_runner as runner_module
+from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 
 
 def _make_runner(need_timing: bool = True):
@@ -146,3 +149,102 @@ def test_sample_tokens_restores_replicated_draft_hidden_states():
     )
     state._replace.assert_called_once_with(aux_hidden_states=[restored_aux_hidden_states])
     assert runner.execute_model_state is restored_state
+
+
+@pytest.mark.parametrize(
+    "dp_size,use_pcp,scheduled,prefilling,dispatch_tokens,padded_tokens",
+    [
+        (2, True, [80, 48], [True, True], 64, 64),
+        (2, True, [18, 1], [True, False], 11, 11),
+        (2, True, [1, 1], [False, False], 2, 4),
+        (1, True, [18, 1], [True, False], 19, 19),
+        (2, False, [18, 1], [True, False], 19, 19),
+    ],
+)
+def test_pcp_dp_dispatch_preserves_full_inputs_before_partition(
+    dp_size, use_pcp, scheduled, prefilling, dispatch_tokens, padded_tokens
+):
+    runner = _make_runner()
+    runner.dp_size = dp_size
+    runner.device = torch.device("cpu")
+    runner.max_num_reqs = 2
+    runner.use_dcp = runner.use_pp = False
+    runner.model_config = SimpleNamespace(rswa_window=None)
+    runner.model_state = SimpleNamespace(num_new_sampled_tokens_per_step=1)
+    runner.eplb = Mock()
+    runner._update_seq_lens_cpu = Mock()
+    runner.input_buffers = AscendInputBuffers(2, 128, runner.device)
+    runner.input_buffers.input_ids.copy_(torch.arange(128, dtype=torch.int32))
+    runner.input_buffers.positions.copy_(torch.arange(128))
+    runner.req_states = SimpleNamespace(
+        num_computed_tokens_np=np.array([64, 0], dtype=np.int32),
+        num_computed_tokens=SimpleNamespace(gpu=torch.tensor([64, 0], dtype=torch.int32)),
+        prefill_len=SimpleNamespace(gpu=torch.tensor([128, 128], dtype=torch.int32)),
+        all_token_ids=SimpleNamespace(gpu=torch.zeros((2, 128), dtype=torch.int32)),
+        next_prefill_tokens=torch.zeros(2, dtype=torch.int32),
+        last_sampled_tokens=torch.zeros(2, dtype=torch.int32),
+        draft_tokens=torch.empty((2, 0), dtype=torch.int32),
+    )
+    runner.pcp_manager = AscendPCPManager(2, 0, runner.device) if use_pcp else None
+    state = BatchReqState(
+        req_ids=["a", "b"],
+        num_scheduled_tokens=np.array(scheduled, dtype=np.int32),
+        num_tokens=sum(scheduled),
+        idx_mapping_np=np.array([1, 0], dtype=np.intp),
+        prefill_len_np=np.array([128, 128], dtype=np.int32),
+        num_computed_prefill_tokens_np=np.array([0, 64], dtype=np.int32),
+        is_prefilling_np=np.array(prefilling),
+        has_prefill=any(prefilling),
+    )
+    scheduler_output = SimpleNamespace(scheduled_spec_decode_tokens={}, has_structured_output_requests=False)
+    uniform_count = None if state.has_prefill else 1
+    with patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(state, uniform_count)):
+        dispatched, actual_uniform_count = runner.gather_batch_req_state(scheduler_output, dummy_run=False)
+    assert dispatched.num_tokens == dispatch_tokens
+    assert actual_uniform_count == uniform_count
+    assert state.num_tokens == sum(scheduled)
+    np.testing.assert_array_equal(dispatched.num_scheduled_tokens, scheduled)
+
+    def copy_to_cpu(value, out=None, device=None):
+        value = torch.as_tensor(value)
+        if out is not None:
+            out.copy_(value)
+            return out
+        return value
+
+    # Stub device kernels, but execute the actual prepare_inputs all the way
+    # to its PCP boundary. Token views and request offsets must agree there.
+    with (
+        patch.object(runner_module, "async_copy_to_gpu", side_effect=copy_to_cpu),
+        patch.object(runner_module, "build_attn_state", return_value=None),
+        patch.object(runner_module, "prepare_prefill_inputs"),
+        patch.object(runner_module, "prepare_pos_seq_lens"),
+        patch.object(runner_module, "combine_sampled_and_draft_tokens", return_value=torch.tensor([0, 1])),
+        patch.object(runner_module, "update_cos_sin"),
+        patch.object(
+            runner_module.vllm_model_runner.pcp, "maybe_partition_pcp_batch", side_effect=lambda manager, batch: batch
+        ) as partition,
+    ):
+        batch = runner.prepare_inputs(
+            scheduler_output,
+            dispatched,
+            SimpleNamespace(num_tokens=padded_tokens, num_reqs=2, cg_mode=CUDAGraphMode.NONE),
+        )
+
+    partition.assert_called_once_with(runner.pcp_manager, batch)
+    expected_size = sum(scheduled) if state.has_prefill else padded_tokens
+    assert batch.num_tokens == sum(scheduled)
+    assert batch.num_tokens_after_padding == expected_size
+    assert batch.input_ids.tolist() == list(range(expected_size))
+    assert batch.positions.tolist() == list(range(expected_size))
+    assert batch.is_padding.shape == (expected_size,)
+    np.testing.assert_array_equal(batch.query_start_loc_np, [0, scheduled[0], sum(scheduled)])
+    assert dispatched.num_tokens == dispatch_tokens
+
+
+def test_pcp_dp_gather_dummy_does_not_require_request_state():
+    runner = _make_runner()
+    runner.dp_size = 2
+    runner.pcp_manager = AscendPCPManager(2, 0, torch.device("cpu"))
+    with patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(None, 1)):
+        assert runner.gather_batch_req_state(object(), dummy_run=True) == (None, 1)

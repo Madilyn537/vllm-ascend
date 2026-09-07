@@ -68,7 +68,16 @@ class AscendModelState(DefaultModelState):
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         is_prefilling = torch.from_numpy(input_batch.is_prefilling_np)
         max_query_len = input_batch.num_scheduled_tokens.max().item()
-        pcp_context = self.pcp_manager.build_attention_context() if self.pcp_manager is not None else None
+        pcp_context = None
+        if self.pcp_manager is not None:
+            # PCP capture passes NONE after partitioning its dummy batch.
+            # Runtime FULL dummy runs also set for_capture to refresh buffers,
+            # but bypass partitioning and need a context for the current dummy.
+            pcp_context = self.pcp_manager.build_attention_context(
+                None if for_capture and cudagraph_mode == CUDAGraphMode.NONE else input_batch,
+                block_tables,
+                slot_mappings,
+            )
         # attn_metadata is needed when update_full_graph_params, but no way can get it now.
         # Temporarily store it in model_state.
         self.attn_metadata = build_attn_metadata(

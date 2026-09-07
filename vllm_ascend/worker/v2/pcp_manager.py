@@ -87,6 +87,11 @@ class AscendPCPManager(PCPManager):
                 )
         is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+        if parallel_config.data_parallel_size > 1 and cudagraph_mode not in {
+            CUDAGraphMode.NONE,
+            CUDAGraphMode.FULL_DECODE_ONLY,
+        }:
+            raise NotImplementedError("MRV2 PCP+DP supports eager mode or FULL_DECODE_ONLY CUDA graphs only.")
         if is_sparse_mla and cudagraph_mode not in {
             CUDAGraphMode.NONE,
             CUDAGraphMode.FULL_DECODE_ONLY,
@@ -145,6 +150,26 @@ class AscendPCPManager(PCPManager):
             local_batch,
             num_draft_tokens=int(local_draft_counts.sum()),
             num_draft_tokens_per_req=local_draft_counts,
+        )
+
+    def get_num_tokens_for_dispatch(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        num_computed_tokens: np.ndarray,
+        is_prefilling: np.ndarray,
+    ) -> int:
+        """Query the PCP execution length without building device-side layout state."""
+        query_start_loc = np.empty(len(num_scheduled_tokens) + 1, dtype=np.int32)
+        query_start_loc[0] = 0
+        np.cumsum(num_scheduled_tokens, out=query_start_loc[1:])
+        return max(
+            sum(
+                segment.num_tokens
+                for segment in self._get_rank_segments(
+                    rank, num_scheduled_tokens, num_computed_tokens, is_prefilling, query_start_loc
+                )
+            )
+            for rank in range(self.pcp_world_size)
         )
 
     def partition_batch(self, input_batch: AscendInputBatch) -> AscendInputBatch:
@@ -307,8 +332,29 @@ class AscendPCPManager(PCPManager):
             graph_slot_mappings[:, target_start + local_num_tokens : target_start + graph_num_tokens].fill_(-1)
         return graph_slot_mappings
 
-    def build_attention_context(self) -> AscendPCPAttentionContext:
+    def build_attention_context(
+        self,
+        input_batch: AscendInputBatch | None = None,
+        block_tables: tuple[torch.Tensor, ...] | None = None,
+        slot_mappings: torch.Tensor | None = None,
+    ) -> AscendPCPAttentionContext:
         """Build the PCP context consumed by attention metadata builders."""
+        if input_batch is not None and input_batch.is_dummy:
+            # Runtime dummy batches bypass partition_batch(), so saved PCP
+            # state may be absent or belong to an earlier real batch.
+            assert block_tables is not None
+            assert slot_mappings is not None
+            num_tokens = input_batch.num_tokens_after_padding
+            restore_start = self.pcp_rank * num_tokens
+            return AscendPCPAttentionContext(
+                global_batch=input_batch,
+                global_block_tables=block_tables,
+                global_slot_mappings=slot_mappings.view(slot_mappings.shape[0], self.pcp_world_size, num_tokens)[
+                    :, self.pcp_rank
+                ],
+                hidden_restore_idx=torch.arange(restore_start, restore_start + num_tokens, device=self.device),
+            )
+
         global_batch = self._global_batch
         hidden_restore_idx = self._hidden_restore_idx
         assert global_batch is not None

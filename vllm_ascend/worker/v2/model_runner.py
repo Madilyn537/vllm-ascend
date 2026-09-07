@@ -561,6 +561,27 @@ class NPUModelRunner(GPUModelRunner):
 
     else:
 
+        def gather_batch_req_state(
+            self, scheduler_output: SchedulerOutput, dummy_run: bool
+        ) -> tuple[BatchReqState | None, int | None]:
+            batch_state, uniform_decode_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
+            if (
+                self.pcp_manager is not None
+                and self.dp_size > 1
+                and batch_state is not None
+                and batch_state.has_prefill
+            ):
+                assert isinstance(self.pcp_manager, AscendPCPManager)
+                # Dispatch needs the PCP-padded execution total; per-request
+                # counts remain global and prepare_inputs restores their sum.
+                num_tokens = self.pcp_manager.get_num_tokens_for_dispatch(
+                    batch_state.num_scheduled_tokens,
+                    self.req_states.num_computed_tokens_np[batch_state.idx_mapping_np],
+                    batch_state.is_prefilling_np,
+                )
+                batch_state = batch_state._replace(num_tokens=num_tokens)
+            return batch_state, uniform_decode_token_count
+
         def prepare_inputs(  # type: ignore[misc]
             self,
             scheduler_output: SchedulerOutput,
@@ -573,6 +594,11 @@ class NPUModelRunner(GPUModelRunner):
             """
             num_tokens = batch_req_state.num_tokens
             num_tokens_after_padding = batch_desc.num_tokens
+            if self.pcp_manager is not None and self.dp_size > 1 and batch_req_state.has_prefill:
+                # The dispatch total is PCP-local. Prefill runs eager and must
+                # first materialize every global token before the existing split.
+                num_tokens = int(batch_req_state.num_scheduled_tokens.sum())
+                num_tokens_after_padding = num_tokens
             assert num_tokens > 0
 
             req_ids = batch_req_state.req_ids
